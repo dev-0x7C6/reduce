@@ -32,12 +32,19 @@ struct stats {
     std::uint64_t file_to_scan{};
 };
 
-auto main() -> int {
-    fs::path path{"."};
+auto main(int argc, const char **argv) -> int {
+    std::vector<fs::path> sources;
+
+    for (auto i = 1; i < argc; ++i)
+        sources.emplace_back(fs::path(argv[i]));
+
+    if (sources.empty())
+        sources.emplace_back(".");
+
     std::vector<fs::path> paths_to_scan;
     std::vector<std::vector<fs::path>> equivalent_path_groups;
 
-    const auto mapped_by_filesize = map_by_filesize({path});
+    const auto mapped_by_filesize = map_by_filesize(sources);
 
     stats stats;
     for (auto &&[_, paths] : mapped_by_filesize) {
