@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -25,6 +26,12 @@ auto map_by_filesize(const std::vector<fs::path> &sources) -> std::map<std::size
     return ret;
 }
 
+struct stats {
+    std::uint64_t file_count{};
+    std::uint64_t files_with_unique_size{};
+    std::uint64_t file_to_scan{};
+};
+
 auto main() -> int {
     fs::path path{"."};
     std::vector<fs::path> paths_to_scan;
@@ -32,10 +39,13 @@ auto main() -> int {
 
     const auto mapped_by_filesize = map_by_filesize({path});
 
-    std::size_t cnt{};
+    stats stats;
     for (auto &&[_, paths] : mapped_by_filesize) {
-        cnt += paths.size();
-        if (paths.size() == 1) continue;
+        stats.file_count += paths.size();
+        if (paths.size() == 1) {
+            stats.files_with_unique_size++;
+            continue;
+        }
 
         auto groups = paths | ranges::views::chunk_by([](auto &&l, auto &&r) {
             return fs::equivalent(l, r);
@@ -44,6 +54,7 @@ auto main() -> int {
         for (auto &&group : groups) {
             if (ranges::distance(group) <= 1) {
                 paths_to_scan.emplace_back(std::move(group.front()));
+                stats.file_to_scan++;
                 continue;
             }
 
@@ -55,14 +66,14 @@ auto main() -> int {
         }
     }
 
-    std::cout << "files found: " << cnt << std::endl;
-    std::cout << "files unique: " << cnt - paths_to_scan.size() << std::endl;
-    std::cout << "files to scan: " << paths_to_scan.size() << std::endl;
+    std::cout << "files found: " << stats.file_count << std::endl;
+    std::cout << "files unique: " << stats.files_with_unique_size << std::endl;
+    std::cout << "files to scan: " << stats.file_to_scan << std::endl;
 
     for (auto &&group : equivalent_path_groups) {
         std::cout << "same: ";
         for (auto &&path : group)
-            std::cout << path;
+            std::cout << path << " ";
         std::cout << std::endl;
     }
 
