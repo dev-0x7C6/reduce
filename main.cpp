@@ -8,33 +8,42 @@
 
 namespace fs = std::filesystem;
 
-auto main() -> int {
-    std::error_code ec{};
-    fs::path path{"."};
+auto map_by_filesize(const std::vector<fs::path> &sources) -> std::map<std::size_t, std::vector<fs::path>> {
+    std::map<std::size_t, std::vector<fs::path>> ret;
     fs::directory_options opts{fs::directory_options::skip_permission_denied};
-    std::map<std::size_t, std::vector<fs::path>> size_reduce;
-    std::vector<fs::path> paths;
-    std::vector<std::vector<fs::path>> equivalent_path_groups;
+    std::error_code ec{};
 
-    for (auto &&entry : fs::recursive_directory_iterator(path, opts, ec)) {
-        if (!entry.is_regular_file()) continue;
-        auto size = entry.file_size(ec);
-        auto path = entry.path();
-        size_reduce[size].emplace_back(std::move(path));
+    for (auto &&source : sources) {
+        for (auto &&entry : fs::recursive_directory_iterator(source, opts, ec)) {
+            if (!entry.is_regular_file()) continue;
+            auto size = entry.file_size(ec);
+            auto path = entry.path();
+            ret[size].emplace_back(std::move(path));
+        }
     }
 
-    std::size_t cnt{};
-    for (auto &&[key, value] : size_reduce) {
-        cnt += value.size();
-        if (value.size() == 1) continue;
+    return ret;
+}
 
-        auto groups = value | ranges::views::chunk_by([](auto &&l, auto &&r) {
+auto main() -> int {
+    fs::path path{"."};
+    std::vector<fs::path> paths_to_scan;
+    std::vector<std::vector<fs::path>> equivalent_path_groups;
+
+    const auto mapped_by_filesize = map_by_filesize({path});
+
+    std::size_t cnt{};
+    for (auto &&[_, paths] : mapped_by_filesize) {
+        cnt += paths.size();
+        if (paths.size() == 1) continue;
+
+        auto groups = paths | ranges::views::chunk_by([](auto &&l, auto &&r) {
             return fs::equivalent(l, r);
         });
 
         for (auto &&group : groups) {
             if (ranges::distance(group) <= 1) {
-                paths.emplace_back(std::move(group.front()));
+                paths_to_scan.emplace_back(std::move(group.front()));
                 continue;
             }
 
@@ -47,8 +56,8 @@ auto main() -> int {
     }
 
     std::cout << "files found: " << cnt << std::endl;
-    std::cout << "files unique: " << cnt - paths.size() << std::endl;
-    std::cout << "files process: " << paths.size() << std::endl;
+    std::cout << "files unique: " << cnt - paths_to_scan.size() << std::endl;
+    std::cout << "files to scan: " << paths_to_scan.size() << std::endl;
 
     for (auto &&group : equivalent_path_groups) {
         std::cout << "same: ";
