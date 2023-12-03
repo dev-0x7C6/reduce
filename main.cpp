@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <range/v3/all.hpp>
+#include <cryptopp/sha.h>
 
 namespace fs = std::filesystem;
 
@@ -25,6 +26,8 @@ auto map_by_filesize(const std::vector<fs::path> &sources) -> std::map<std::size
 
     return ret;
 }
+
+
 
 struct stats {
     std::uint64_t file_count{};
@@ -74,7 +77,7 @@ auto main(int argc, const char **argv) -> int {
     }
 
     std::cout << "files found: " << stats.file_count << std::endl;
-    std::cout << "files unique: " << stats.files_with_unique_size << std::endl;
+    std::cout << "files with unique size: " << stats.files_with_unique_size << std::endl;
     std::cout << "files to scan: " << stats.file_to_scan << std::endl;
 
     for (auto &&group : equivalent_path_groups) {
