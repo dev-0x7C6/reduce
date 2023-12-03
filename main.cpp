@@ -5,8 +5,9 @@
 #include <ranges>
 #include <vector>
 
-#include <range/v3/all.hpp>
 #include <cryptopp/sha.h>
+#include <fcntl.h>
+#include <range/v3/all.hpp>
 
 namespace fs = std::filesystem;
 
@@ -27,13 +28,54 @@ auto map_by_filesize(const std::vector<fs::path> &sources) -> std::map<std::size
     return ret;
 }
 
-
-
 struct stats {
     std::uint64_t file_count{};
     std::uint64_t files_with_unique_size{};
     std::uint64_t file_to_scan{};
 };
+
+namespace raii {
+struct open {
+    template <typename... Ts>
+    open(Ts &&...args)
+            : descriptor(::open(std::forward<Ts>(args)...)) {}
+
+    ~open() {
+        if (descriptor != -1)
+            ::close(descriptor);
+    }
+
+    operator auto() const noexcept {
+        return descriptor;
+    }
+
+private:
+    const int descriptor{};
+};
+} // namespace raii
+
+template <typename Algorithm = CryptoPP::SHA1>
+auto compute(const fs::path &path) -> std::vector<CryptoPP::byte> {
+    const auto fd = raii::open(path.c_str(), O_RDONLY);
+    if (!fd) return {};
+
+    Algorithm algo;
+    std::vector<CryptoPP::byte> buffer(4096);
+
+    ::lseek64(fd, 0, SEEK_SET);
+    for (;;) {
+        const auto size = ::read(fd, buffer.data(), buffer.size());
+        if (size == 0) break;
+        if (size <= 0) return {};
+
+        algo.Update(buffer.data(), size);
+    }
+
+    buffer.resize(algo.DigestSize());
+    algo.Final(buffer.data());
+
+    return buffer;
+}
 
 auto main(int argc, const char **argv) -> int {
     std::vector<fs::path> sources;
@@ -79,6 +121,11 @@ auto main(int argc, const char **argv) -> int {
     std::cout << "files found: " << stats.file_count << std::endl;
     std::cout << "files with unique size: " << stats.files_with_unique_size << std::endl;
     std::cout << "files to scan: " << stats.file_to_scan << std::endl;
+
+    for (auto &&file : paths_to_scan) {
+        std::cout << "calc: " << file << std::endl;
+        compute(file);
+    }
 
     for (auto &&group : equivalent_path_groups) {
         std::cout << "same: ";
