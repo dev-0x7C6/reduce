@@ -112,7 +112,7 @@ auto to_digest(Algorithm &processor, bool finished) noexcept {
 }
 
 template <typename Algorithm = algo, auto buffer_size = 4096>
-auto compute_fd(sequential, const raii::open &fd) -> digest_t<Algorithm> {
+auto compute(sequential, const raii::open &fd) -> digest_t<Algorithm> {
     if (!fd) return {};
 
     Algorithm processor;
@@ -133,11 +133,11 @@ auto compute_fd(sequential, const raii::open &fd) -> digest_t<Algorithm> {
 }
 
 template <typename Algorithm = algo, auto buffer_size>
-auto compute_fd(corners, const raii::open &fd) -> digest_t<Algorithm> {
+auto compute(corners, const raii::open &fd) -> digest_t<Algorithm> {
     if (!fd) return {};
 
     if (fd.file_size() <= buffer_size * 2)
-        return compute_fd(sequential{}, fd);
+        return compute(sequential{}, fd);
 
     Algorithm processor;
     std::array<CryptoPP::byte, buffer_size> buffer{};
@@ -154,11 +154,11 @@ auto compute_fd(corners, const raii::open &fd) -> digest_t<Algorithm> {
 }
 
 template <typename Algorithm = algo, auto buffer_size>
-auto compute_fd(middle, const raii::open &fd) -> digest_t<Algorithm> {
+auto compute(middle, const raii::open &fd) -> digest_t<Algorithm> {
     if (!fd) return {};
 
     if (fd.file_size() <= buffer_size)
-        return compute_fd(sequential{}, fd);
+        return compute(sequential{}, fd);
 
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
     ::lseek64(fd, fd.file_size() / 2 - buffer_size / 2, SEEK_SET);
@@ -172,7 +172,7 @@ auto compute_fd(middle, const raii::open &fd) -> digest_t<Algorithm> {
 
 template <typename Algorithm = algo, auto buffer_size, typename strategy_t>
 auto compute(const ext_path &ex, strategy_t = {}) -> digest_t<Algorithm> {
-    return compute_fd<Algorithm, buffer_size>(strategy_t{}, raii::open(ex.size, ex.path.c_str(), O_RDONLY));
+    return compute<Algorithm, buffer_size>(strategy_t{}, raii::open(ex.size, ex.path.c_str(), O_RDONLY));
 }
 
 auto to_string(const std::vector<CryptoPP::byte> &digest) {
@@ -292,10 +292,8 @@ auto main(int argc, const char **argv) -> int {
         }
     }
     auto &&out = *console;
-    out.info("files found: {}", stats.file_count);
-    out.info("files with unique size: {}", stats.files_with_unique_size);
-    out.info("files to scan: {}", stats.file_to_scan);
-
+    out.info("Total files found: {}", stats.file_count);
+    out.info("Eliminating by unique file size: {} files", stats.file_to_scan);
     out.info("Eliminating by 4KiB corners: {} files", stage.size());
     stage = find_duplicates<CryptoPP::SHA1, corners, 4096>(stage);
 
