@@ -19,6 +19,21 @@
 static auto console = []() {
     auto console = spdlog::stdout_color_mt("console");
     console->set_pattern("[%L] %v");
+    // console->set_level(spdlog::level::debug);
+    return console;
+}();
+
+static auto threading_logger = []() {
+    auto console = spdlog::stdout_color_mt("threading");
+    console->set_pattern("[%L] %v");
+    console->set_level(spdlog::level::off);
+    return console;
+}();
+
+static auto file_logger = []() {
+    auto console = spdlog::stdout_color_mt("file");
+    console->set_pattern("[%L] %v");
+    console->set_level(spdlog::level::off);
     return console;
 }();
 
@@ -117,7 +132,7 @@ auto compute_fd(sequential, const raii::open &fd) -> digest_t<Algorithm> {
     return to_digest(processor, true);
 }
 
-template <typename Algorithm = algo, auto buffer_size = 4096>
+template <typename Algorithm = algo, auto buffer_size>
 auto compute_fd(corners, const raii::open &fd) -> digest_t<Algorithm> {
     if (!fd) return {};
 
@@ -138,7 +153,7 @@ auto compute_fd(corners, const raii::open &fd) -> digest_t<Algorithm> {
     return to_digest(processor, false);
 }
 
-template <typename Algorithm = algo, auto buffer_size = 4096>
+template <typename Algorithm = algo, auto buffer_size>
 auto compute_fd(middle, const raii::open &fd) -> digest_t<Algorithm> {
     if (!fd) return {};
 
@@ -155,17 +170,17 @@ auto compute_fd(middle, const raii::open &fd) -> digest_t<Algorithm> {
     return to_digest(processor, false);
 }
 
-template <typename Algorithm = algo, auto buffer_size = 4096, typename strategy_t>
+template <typename Algorithm = algo, auto buffer_size, typename strategy_t>
 auto compute(const ext_path &ex, strategy_t = {}) -> digest_t<Algorithm> {
-    return compute_fd(strategy_t{}, raii::open(ex.size, ex.path.c_str(), O_RDONLY));
+    return compute_fd<Algorithm, buffer_size>(strategy_t{}, raii::open(ex.size, ex.path.c_str(), O_RDONLY));
 }
 
 auto to_string(const std::vector<CryptoPP::byte> &digest) {
     return fmt::format("{:02x}", fmt::join(digest, {}));
 }
 
-template <typename Algorithm, typename Strategy, auto buffer_size = 4096>
-auto find_duplicates(::ranges::range auto &&files, int flags = {}, std::optional<std::uint64_t> limit = {}) -> std::vector<ext_path> {
+template <typename Algorithm, typename Strategy, auto buffer_size>
+auto find_duplicates(::ranges::range auto &&files) -> std::vector<ext_path> {
     using result = map_container<digest_t<Algorithm>, std::vector<ext_path>>;
 
     const auto concurrency_count = std::thread::hardware_concurrency();
@@ -199,14 +214,15 @@ auto find_duplicates(::ranges::range auto &&files, int flags = {}, std::optional
     for (int i{}; auto &&group : groups) {
         if (files.size() == 0) continue;
 
-        std::packaged_task task([files{std::move(group)}, flags, limit, i]() -> result {
-            console->debug("thread [{}]: started", i);
+        std::packaged_task task([files{std::move(group)}, i]() -> result {
+            threading_logger->debug("thread [{}]: started", i);
             result ret;
             for (auto &&file : files) {
-                const auto hash = compute(file, Strategy{});
+                const auto hash = compute<Algorithm, buffer_size>(file, Strategy{});
+                file_logger->debug("thread [{}]: {:02x} {}", i, fmt::join(hash, {}), file.path.c_str());
                 ret[hash].emplace_back(std::move(file));
             }
-            console->debug("thread [{}]: finished", i);
+            threading_logger->debug("thread [{}]: finished", i);
             return ret;
         });
 
@@ -220,12 +236,15 @@ auto find_duplicates(::ranges::range auto &&files, int flags = {}, std::optional
     threads.clear(); // wait
 
     auto &&from_future = [](auto &&f) { return std::move(f.get()); };
-    auto &&sync_results = results | ranges::views::transform(from_future);
 
-    for (auto &&mapped : sync_results)
-        for (auto &&[_, paths] : mapped)
-            if (paths.size() > 1)
-                std::move(std::begin(paths), std::end(paths), std::back_inserter(ret));
+    result aggregator;
+    for (auto partial_results : results | ranges::views::transform(from_future))
+        for (auto &&[hash, paths] : partial_results)
+            std::move(std::begin(paths), std::end(paths), std::back_inserter(aggregator[hash]));
+
+    for (auto &&[hash, paths] : aggregator)
+        if (paths.size() > 1 && hash.back() == 0x00)
+            std::move(std::begin(paths), std::end(paths), std::back_inserter(ret));
 
     return ret;
 }
@@ -302,7 +321,7 @@ auto main(int argc, const char **argv) -> int {
     }
 
     out.info("Eliminating by whole read: {} files", stage.size());
-    stage = find_duplicates<CryptoPP::SHA1, sequential>(stage);
+    stage = find_duplicates<CryptoPP::SHA1, sequential, 4096>(stage);
 
     if (stage.empty()) {
         out.info("Finished");
