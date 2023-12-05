@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
@@ -23,12 +24,18 @@ static auto console = []() {
 
 namespace fs = std::filesystem;
 
-auto map_by_filesize(const std::vector<fs::path> &sources) -> std::map<std::size_t, std::vector<fs::path>> {
-    std::map<std::size_t, std::vector<fs::path>> ret;
+using algo = CryptoPP::SHA1;
+using digest_t = std::array<CryptoPP::byte, 20>;
+
+template <typename... Ts>
+using map_container = std::map<Ts...>;
+
+auto map_by_filesize(const std::vector<fs::path> &sources) -> map_container<std::size_t, std::vector<fs::path>> {
+    map_container<std::size_t, std::vector<fs::path>> ret;
     fs::directory_options opts{fs::directory_options::skip_permission_denied};
-    std::error_code ec{};
 
     for (auto &&source : sources) {
+        std::error_code ec{};
         for (auto &&entry : fs::recursive_directory_iterator(source, opts, ec)) {
             if (!entry.is_regular_file()) continue;
             auto size = entry.file_size(ec);
@@ -49,7 +56,6 @@ struct stats {
 struct ext_path {
     fs::path path;
     std::uint64_t size{};
-    std::vector<CryptoPP::byte> hash;
 };
 
 namespace raii {
@@ -72,83 +78,173 @@ private:
 };
 } // namespace raii
 
-template <typename Algorithm = CryptoPP::SHA256>
-auto compute(const fs::path &path, int flags = {}, std::optional<std::int64_t> limit = {}) -> std::vector<CryptoPP::byte> {
-    const auto fd = raii::open(path.c_str(), O_RDONLY);
+struct compute_strategy {
+    std::int64_t offset{};
+    int fadvise_flags{};
+    int seek_flags{SEEK_SET};
+    std::optional<std::int64_t> read_limit;
+};
+
+struct sequential {};
+struct corners {};
+struct middle {};
+
+template <typename Algorithm = algo, auto buffer_size = 4096>
+auto compute_fd(sequential, const raii::open &fd, std::uint64_t, compute_strategy strategy = {}) -> digest_t {
     if (!fd) return {};
 
-    Algorithm algo;
-    static thread_local std::vector<CryptoPP::byte> buffer(4096);
-    ::posix_fadvise(fd, 0, 0, flags);
-    ::lseek64(fd, 0, SEEK_SET);
+    Algorithm processor;
+    std::array<CryptoPP::byte, buffer_size> buffer{};
+
+    ::posix_fadvise(fd, 0, 0, strategy.fadvise_flags);
+    ::lseek64(fd, strategy.offset, strategy.seek_flags);
+
     for (;;) {
         const auto size = ::read(fd, buffer.data(), buffer.size());
         if (size == 0) break;
         if (size <= 0) return {};
 
-        algo.Update(buffer.data(), size);
+        processor.Update(buffer.data(), size);
 
-        if (limit) {
-            limit.value() -= size;
-            if (limit <= 0)
+        if (strategy.read_limit) {
+            strategy.read_limit.value() -= size;
+            if (strategy.read_limit <= 0)
                 break;
         }
     }
 
-    buffer.resize(algo.DigestSize());
-    algo.Final(buffer.data());
+    digest_t digest{};
+    processor.Final(digest.data());
+    return digest;
+}
 
-    return buffer;
+template <typename Algorithm = algo, auto buffer_size = 4096>
+auto compute_fd(corners, const raii::open &fd, std::uint64_t size, compute_strategy = {}) -> digest_t {
+    if (!fd) return {};
+
+    if (size <= buffer_size * 2)
+        return compute_fd(sequential{}, fd, size, {
+                                                      .fadvise_flags = POSIX_FADV_SEQUENTIAL, //
+                                                  });
+
+    Algorithm processor;
+    std::array<CryptoPP::byte, buffer_size> buffer{};
+
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+
+    ::lseek64(fd, 0, SEEK_SET);
+    processor.Update(buffer.data(), ::read(fd, buffer.data(), buffer.size()));
+
+    ::lseek64(fd, -buffer.size(), SEEK_END);
+    processor.Update(buffer.data(), ::read(fd, buffer.data(), buffer.size()));
+
+    digest_t digest{};
+    processor.Final(digest.data());
+    return digest;
+}
+
+template <typename Algorithm = algo, auto buffer_size = 4096>
+auto compute_fd(middle, const raii::open &fd, std::uint64_t size, compute_strategy = {}) -> digest_t {
+    if (!fd) return {};
+
+    if (size <= buffer_size)
+        return compute_fd(sequential{}, fd, size, {
+                                                      .fadvise_flags = POSIX_FADV_SEQUENTIAL, //
+                                                  });
+
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    ::lseek64(fd, size / 2 - buffer_size / 2, SEEK_SET);
+
+    Algorithm processor;
+    std::array<CryptoPP::byte, buffer_size> buffer{};
+    processor.Update(buffer.data(), ::read(fd, buffer.data(), buffer.size()));
+
+    digest_t digest{};
+    processor.Final(digest.data());
+    return digest;
+}
+
+template <typename Algorithm = algo, auto buffer_size = 4096, typename strategy_t>
+auto compute(const ext_path &ex, compute_strategy strategy = {}, strategy_t = {}) -> digest_t {
+    return compute_fd(strategy_t{}, raii::open(ex.path.c_str(), O_RDONLY), ex.size, strategy);
 }
 
 auto to_string(const std::vector<CryptoPP::byte> &digest) {
     return fmt::format("{:02x}", fmt::join(digest, {}));
 }
 
-auto find_duplicates(::ranges::range auto &&to_scan, int flags = {}, std::optional<std::uint64_t> limit = {}) -> std::vector<ext_path> {
-    const auto total_size = ranges::accumulate(to_scan, std::uint64_t{0}, [](auto &&acc, auto &&entry) {
-        return acc + entry.size;
-    });
+template <typename strategy>
+auto find_duplicates(strategy, ::ranges::range auto &&to_scan, int flags = {}, std::optional<std::uint64_t> limit = {}) -> std::vector<ext_path> {
 
-    const auto size_per_thread = total_size / std::thread::hardware_concurrency();
+    // const auto size_per_thread = total_size / std::thread::hardware_concurrency();
 
-    console->info("total size: {:.3f} MiB", total_size / 1024.0 / 1024.0);
-    console->info("files count: {}", to_scan.size());
-    console->info("cpu threads: {}", std::thread::hardware_concurrency());
-    console->info("cpu size per thread: {:.3f} MiB", size_per_thread / 1024.0 / 1024.0);
+    // console->info("total size: {:.3f} MiB", total_size / 1024.0 / 1024.0);
+    // console->info("files count: {}", to_scan.size());
+    // console->info("cpu threads: {}", std::thread::hardware_concurrency());
+    // console->info("cpu size per thread: {:.3f} MiB", size_per_thread / 1024.0 / 1024.0);
+    // console->info("threads to be used: {}", ranges::distance(workloads));
+    using result = map_container<digest_t, std::vector<ext_path>>;
 
-    auto workloads = to_scan | ranges::views::chunk_by([size_per_thread](auto &&l, auto &&r) {
-        static std::uint64_t acc{};
-        if (size_per_thread > (acc += l.size)) return true;
-        acc = 0;
-        return false;
-    });
-
-    console->info("threads to be used: {}", ranges::distance(workloads));
-    using result = std::map<std::vector<CryptoPP::byte>, std::vector<ext_path>>;
+    const auto concurrency_count = std::thread::hardware_concurrency();
 
     std::vector<std::jthread> threads;
     std::vector<std::future<result>> results;
-    for (auto &&workload : workloads) {
-        std::packaged_task task([workload{std::move(workload)}, flags, limit]() -> result {
+    std::vector<std::vector<ext_path>> tasks(concurrency_count);
+
+    threads.reserve(concurrency_count);
+    results.reserve(concurrency_count);
+
+    for (auto &&task : tasks)
+        task.reserve(to_scan.size() / concurrency_count);
+
+    for (auto &&va : to_scan | ranges::views::chunk(concurrency_count)) {
+        for (std::size_t i = 0; auto &value : va)
+            tasks[i++].emplace_back(value);
+    }
+
+    for (std::size_t i = 0; auto &&task : tasks) {
+        const auto total = ranges::accumulate(task, std::size_t{}, [](auto &&acc, auto &&r) {
+            return acc + r.size;
+        });
+
+        if (task.size()) {
+            console->debug("thread [{}]: files to scan: {}", i, task.size());
+            console->debug("thread [{}]: total size MiB: {:.3f} MiB", i, total / 1024.0 / 1024.0);
+        }
+        ++i;
+    }
+
+    for (int i{}; auto &&workload : tasks) {
+        if (workload.size() == 0) continue;
+
+        std::packaged_task task([workload{std::move(workload)}, flags, limit, i]() -> result {
+            console->debug("thread [{}]: started", i);
             result ret;
             for (auto &&file : workload) {
-                file.hash = compute(file.path, flags, limit);
-                console->debug("processing {}, {}", file.path.c_str(), to_string(file.hash));
-                ret[file.hash].emplace_back(std::move(file));
+                const auto hash = compute(file, compute_strategy{
+                                                    .fadvise_flags = flags, //
+                                                    .read_limit = limit, //
+                                                },
+                    strategy{});
+                ret[hash].emplace_back(std::move(file));
             }
+            console->debug("thread [{}]: finished", i);
             return ret;
         });
 
         results.emplace_back(task.get_future());
         threads.emplace_back(std::move(task));
+        i++;
     }
-
-    threads.clear(); // wait
 
     std::vector<ext_path> ret;
     ret.reserve(to_scan.size());
-    for (auto &&mapped : results | ranges::views::transform([](auto &&f) { return std::move(f.get()); }))
+    threads.clear(); // wait
+
+    auto &&from_future = [](auto &&f) { return std::move(f.get()); };
+    auto &&sync_results = results | ranges::views::transform(from_future);
+
+    for (auto &&mapped : sync_results)
         for (auto &&[_, paths] : mapped)
             if (paths.size() > 1)
                 std::move(std::begin(paths), std::end(paths), std::back_inserter(ret));
@@ -165,7 +261,7 @@ auto main(int argc, const char **argv) -> int {
     if (sources.empty())
         sources.emplace_back(".");
 
-    std::vector<ext_path> paths_to_scan;
+    std::vector<ext_path> stage;
     std::vector<std::vector<fs::path>> equivalent_path_groups;
 
     const auto mapped_by_filesize = map_by_filesize(sources);
@@ -183,14 +279,13 @@ auto main(int argc, const char **argv) -> int {
         });
 
         for (auto &&group : groups) {
-            if (ranges::distance(group) <= 1) {
-                paths_to_scan.emplace_back(ext_path{
-                    .path = std::move(group.front()), //
-                    .size = size, //
-                });
-                stats.file_to_scan++;
-                continue;
-            }
+            stage.emplace_back(ext_path{
+                .path = std::move(group.front()), //
+                .size = size, //
+            });
+            stats.file_to_scan++;
+
+            if ((ranges::distance(group) == 1)) continue;
 
             static std::vector<fs::path> equivalents;
             for (auto &&path : group)
@@ -204,23 +299,44 @@ auto main(int argc, const char **argv) -> int {
     out.info("files with unique size: {}", stats.files_with_unique_size);
     out.info("files to scan: {}", stats.file_to_scan);
 
-    ranges::sort(paths_to_scan, [](auto &&l, auto &&r) {
-        return l.size < r.size;
-    });
+    out.info("Eliminating by 4KiB corners: {} files", stage.size());
+    stage = find_duplicates(corners{}, stage, POSIX_FADV_RANDOM, 4096);
 
-    out.info("stage 0: {}", paths_to_scan.size());
-    auto stage1 = find_duplicates(paths_to_scan, POSIX_FADV_NOREUSE, 4096);
-    out.info("stage 1: {}", stage1.size());
-    auto stage2 = find_duplicates(stage1, POSIX_FADV_SEQUENTIAL, 4096 * 16);
-    out.info("stage 2: {}", stage2.size());
-    auto stage3 = find_duplicates(stage2, POSIX_FADV_SEQUENTIAL);
-    out.info("stage 3: {}", stage3.size());
+    if (stage.empty()) {
+        out.info("Finished");
+        return {};
+    }
+
+    out.info("Eliminating by 64KiB corners: {} files", stage.size());
+    stage = find_duplicates(corners{}, stage, POSIX_FADV_RANDOM, 4096 * 16);
+
+    if (stage.empty()) {
+        out.info("Finished");
+        return {};
+    }
+
+    out.info("Eliminating by 64KiB middle: {} files", stage.size());
+    stage = find_duplicates(middle{}, stage, POSIX_FADV_RANDOM, 4096 * 16);
+
+    if (stage.empty()) {
+        out.info("Finished");
+        return {};
+    }
+
+    out.info("Eliminating by whole read: {} files", stage.size());
+    stage = find_duplicates(sequential{}, stage, POSIX_FADV_SEQUENTIAL);
+
+    if (stage.empty()) {
+        out.info("Finished");
+        return {};
+    }
 
     for (auto &&group : equivalent_path_groups) {
-        std::cout << "same: ";
-        for (auto &&path : group)
-            std::cout << path << " ";
-        std::cout << std::endl;
+        auto &&paths = group | ranges::views::transform([](auto &&path) {
+            return path.c_str();
+        });
+
+        out.debug("same {}", fmt::join(paths, " "));
     }
 
     return {};
