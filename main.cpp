@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -10,6 +11,15 @@
 #include <cryptopp/sha.h>
 #include <fcntl.h>
 #include <range/v3/all.hpp>
+
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
+static auto console = []() {
+    auto console = spdlog::stdout_color_mt("console");
+    console->set_pattern("[%L] %v");
+    return console;
+}();
 
 namespace fs = std::filesystem;
 
@@ -39,6 +49,7 @@ struct stats {
 struct ext_path {
     fs::path path;
     std::uint64_t size{};
+    std::vector<CryptoPP::byte> hash;
 };
 
 namespace raii {
@@ -61,13 +72,13 @@ private:
 };
 } // namespace raii
 
-template <typename Algorithm = CryptoPP::SHA1>
+template <typename Algorithm = CryptoPP::SHA256>
 auto compute(const fs::path &path, int flags = {}, std::optional<std::int64_t> limit = {}) -> std::vector<CryptoPP::byte> {
     const auto fd = raii::open(path.c_str(), O_RDONLY);
     if (!fd) return {};
 
     Algorithm algo;
-    std::vector<CryptoPP::byte> buffer(4096);
+    static thread_local std::vector<CryptoPP::byte> buffer(4096);
     ::posix_fadvise(fd, 0, 0, flags);
     ::lseek64(fd, 0, SEEK_SET);
     for (;;) {
@@ -90,15 +101,21 @@ auto compute(const fs::path &path, int flags = {}, std::optional<std::int64_t> l
     return buffer;
 }
 
-auto find_duplicates(const std::vector<ext_path> &to_scan, int flags = {}, std::optional<std::uint64_t> limit = {}) -> std::vector<ext_path> {
+auto to_string(const std::vector<CryptoPP::byte> &digest) {
+    return fmt::format("{:02x}", fmt::join(digest, {}));
+}
+
+auto find_duplicates(::ranges::range auto &&to_scan, int flags = {}, std::optional<std::uint64_t> limit = {}) -> std::vector<ext_path> {
     const auto total_size = ranges::accumulate(to_scan, std::uint64_t{0}, [](auto &&acc, auto &&entry) {
         return acc + entry.size;
     });
 
     const auto size_per_thread = total_size / std::thread::hardware_concurrency();
 
-    std::cout << "total size: " << total_size << std::endl;
-    std::cout << "size per thread: " << size_per_thread << std::endl;
+    console->info("total size: {:.3f} MiB", total_size / 1024.0 / 1024.0);
+    console->info("files count: {}", to_scan.size());
+    console->info("cpu threads: {}", std::thread::hardware_concurrency());
+    console->info("cpu size per thread: {:.3f} MiB", size_per_thread / 1024.0 / 1024.0);
 
     auto workloads = to_scan | ranges::views::chunk_by([size_per_thread](auto &&l, auto &&r) {
         static std::uint64_t acc{};
@@ -107,9 +124,7 @@ auto find_duplicates(const std::vector<ext_path> &to_scan, int flags = {}, std::
         return false;
     });
 
-    std::cout << std::thread::hardware_concurrency() << std::endl;
-    std::cout << ranges::distance(workloads) << std::endl;
-
+    console->info("threads to be used: {}", ranges::distance(workloads));
     using result = std::map<std::vector<CryptoPP::byte>, std::vector<ext_path>>;
 
     std::vector<std::jthread> threads;
@@ -118,8 +133,9 @@ auto find_duplicates(const std::vector<ext_path> &to_scan, int flags = {}, std::
         std::packaged_task task([workload{std::move(workload)}, flags, limit]() -> result {
             result ret;
             for (auto &&file : workload) {
-                auto hash = compute(file.path, flags, limit);
-                ret[hash].emplace_back(std::move(file));
+                file.hash = compute(file.path, flags, limit);
+                console->debug("processing {}, {}", file.path.c_str(), to_string(file.hash));
+                ret[file.hash].emplace_back(std::move(file));
             }
             return ret;
         });
@@ -133,7 +149,7 @@ auto find_duplicates(const std::vector<ext_path> &to_scan, int flags = {}, std::
     std::vector<ext_path> ret;
     ret.reserve(to_scan.size());
     for (auto &&mapped : results | ranges::views::transform([](auto &&f) { return std::move(f.get()); }))
-        for (auto &&[hash, paths] : mapped)
+        for (auto &&[_, paths] : mapped)
             if (paths.size() > 1)
                 std::move(std::begin(paths), std::end(paths), std::back_inserter(ret));
 
@@ -183,18 +199,22 @@ auto main(int argc, const char **argv) -> int {
             equivalent_path_groups.emplace_back(std::move(equivalents));
         }
     }
+    auto &&out = *console;
+    out.info("files found: {}", stats.file_count);
+    out.info("files with unique size: {}", stats.files_with_unique_size);
+    out.info("files to scan: {}", stats.file_to_scan);
 
-    std::cout << "files found: " << stats.file_count << std::endl;
-    std::cout << "files with unique size: " << stats.files_with_unique_size << std::endl;
-    std::cout << "files to scan: " << stats.file_to_scan << std::endl;
+    ranges::sort(paths_to_scan, [](auto &&l, auto &&r) {
+        return l.size < r.size;
+    });
 
-    std::cout << "stage 0: " << paths_to_scan.size() << std::endl;
+    out.info("stage 0: {}", paths_to_scan.size());
     auto stage1 = find_duplicates(paths_to_scan, POSIX_FADV_NOREUSE, 4096);
-    std::cout << "stage 1: " << stage1.size() << std::endl;
+    out.info("stage 1: {}", stage1.size());
     auto stage2 = find_duplicates(stage1, POSIX_FADV_SEQUENTIAL, 4096 * 16);
-    std::cout << "stage 2: " << stage2.size() << std::endl;
+    out.info("stage 2: {}", stage2.size());
     auto stage3 = find_duplicates(stage2, POSIX_FADV_SEQUENTIAL);
-    std::cout << "stage 3: " << stage3.size() << std::endl;
+    out.info("stage 3: {}", stage3.size());
 
     for (auto &&group : equivalent_path_groups) {
         std::cout << "same: ";
