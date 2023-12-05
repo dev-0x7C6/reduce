@@ -27,7 +27,7 @@ namespace fs = std::filesystem;
 using algo = CryptoPP::SHA1;
 
 template <typename Algorithm>
-using digest_t = std::array<CryptoPP::byte, Algorithm::DIGESTSIZE>;
+using digest_t = std::array<CryptoPP::byte, Algorithm::DIGESTSIZE + 1>;
 
 template <typename... Ts>
 using map_container = std::map<Ts...>;
@@ -89,9 +89,10 @@ struct corners {};
 struct middle {};
 
 template <typename Algorithm = algo>
-auto to_digest(Algorithm &processor) noexcept {
+auto to_digest(Algorithm &processor, bool finished) noexcept {
     digest_t<Algorithm> digest;
     processor.Final(digest.data());
+    digest.back() = finished ? 0xff : 0x00;
     return digest;
 }
 
@@ -113,7 +114,7 @@ auto compute_fd(sequential, const raii::open &fd) -> digest_t<Algorithm> {
         processor.Update(buffer.data(), size);
     }
 
-    return to_digest(processor);
+    return to_digest(processor, true);
 }
 
 template <typename Algorithm = algo, auto buffer_size = 4096>
@@ -134,7 +135,7 @@ auto compute_fd(corners, const raii::open &fd) -> digest_t<Algorithm> {
     ::lseek64(fd, -buffer.size(), SEEK_END);
     processor.Update(buffer.data(), ::read(fd, buffer.data(), buffer.size()));
 
-    return to_digest(processor);
+    return to_digest(processor, false);
 }
 
 template <typename Algorithm = algo, auto buffer_size = 4096>
@@ -151,7 +152,7 @@ auto compute_fd(middle, const raii::open &fd) -> digest_t<Algorithm> {
     std::array<CryptoPP::byte, buffer_size> buffer{};
     processor.Update(buffer.data(), ::read(fd, buffer.data(), buffer.size()));
 
-    return to_digest(processor);
+    return to_digest(processor, false);
 }
 
 template <typename Algorithm = algo, auto buffer_size = 4096, typename strategy_t>
